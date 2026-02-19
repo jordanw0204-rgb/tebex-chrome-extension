@@ -67,6 +67,15 @@ function setStatus(text) {
   statusDiv.textContent = text;
 }
 
+function debugLog(message, data) {
+  const timestamp = new Date().toISOString();
+  if (typeof data === "undefined") {
+    console.log(`[TebexUploader][${timestamp}] ${message}`);
+  } else {
+    console.log(`[TebexUploader][${timestamp}] ${message}`, data);
+  }
+}
+
 function setProgress(percent) {
   const clamped = Math.max(0, Math.min(100, Math.round(percent)));
   progressFill.style.width = `${clamped}%`;
@@ -478,7 +487,24 @@ function renderUploadSummary(result) {
   }
 }
 
-async function applyZipFilesToPage(tabId, filesByPath) {
+function emitUploadDebugLogs(result, fileName) {
+  const logs = Array.isArray(result && result.logs) ? result.logs : [];
+  if (logs.length === 0) {
+    return;
+  }
+
+  debugLog(`Page script logs for ${fileName} (${logs.length})`);
+  for (const line of logs) {
+    debugLog(line);
+  }
+}
+
+async function applyZipFilesToPage(tabId, filesByPath, options = {}) {
+  const timeoutMs =
+    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Number(options.timeoutMs) : 90000;
+  const tryAllFrames = options.tryAllFrames !== false;
+  const label = options.label || "Upload script";
+
   function withTimeout(promise, timeoutMs, label) {
     return Promise.race([
       promise,
@@ -491,6 +517,11 @@ async function applyZipFilesToPage(tabId, filesByPath) {
   }
 
   async function runApply(allFrames) {
+    debugLog("Invoking page upload script", {
+      allFrames,
+      timeoutMs,
+      fileCount: Object.keys(filesByPath || {}).length
+    });
     const injection = await withTimeout(
       chrome.scripting.executeScript({
         target: { tabId, allFrames },
@@ -498,8 +529,8 @@ async function applyZipFilesToPage(tabId, filesByPath) {
         func: applyTemplatesInPage,
         args: [filesByPath]
       }),
-      90000,
-      "Upload script"
+      timeoutMs,
+      label
     );
 
     if (!Array.isArray(injection) || injection.length === 0) {
@@ -520,6 +551,10 @@ async function applyZipFilesToPage(tabId, filesByPath) {
     }
 
     if (supportedResults.length === 0) {
+      debugLog("Page upload script returned no supported frame result", {
+        allFrames,
+        frameErrors
+      });
       if (frameErrors.length > 0) {
         return {
           isSupportedPage: false,
@@ -549,6 +584,11 @@ async function applyZipFilesToPage(tabId, filesByPath) {
       return Number(b.matchedCount || 0) - Number(a.matchedCount || 0);
     });
 
+    debugLog("Page upload script completed", {
+      allFrames,
+      bestUploaded: Number(supportedResults[0].uploadedCount || 0),
+      bestMatched: Number(supportedResults[0].matchedCount || 0)
+    });
     return supportedResults[0];
   }
 
@@ -558,6 +598,10 @@ async function applyZipFilesToPage(tabId, filesByPath) {
   }
 
   if (Number(topFrameResult.uploadedCount || 0) > 0) {
+    return topFrameResult;
+  }
+
+  if (!tryAllFrames) {
     return topFrameResult;
   }
 
@@ -578,9 +622,11 @@ async function importFromZip(zipFile) {
   fileListDiv.innerHTML = "";
 
   try {
+    debugLog("Import started", { fileName: zipFile.name, size: zipFile.size });
     setProgress(5);
     setStatus("Checking active tab...");
     const tab = await getActiveTab();
+    debugLog("Active tab resolved", { id: tab.id, url: tab.url });
 
     setProgress(8);
     setStatus(`Loading ZIP: ${zipFile.name}`);
@@ -590,6 +636,7 @@ async function importFromZip(zipFile) {
       .map((name) => normalizePath(name))
       .filter((name) => isImportExportFilePath(name))
       .sort((a, b) => a.localeCompare(b));
+    debugLog("ZIP parsed", { totalEntries: sortedFiles.length });
 
     if (sortedFiles.length === 0) {
       throw new Error("ZIP does not contain importable .html/.twig/.js/.css files.");
@@ -600,17 +647,83 @@ async function importFromZip(zipFile) {
       cleanedFiles[fileName] = filesByPath[fileName];
     }
 
-    setProgress(40);
+    setProgress(38);
     setStatus(`Uploading ${sortedFiles.length} file(s) to Tebex editor...`);
-    const uploadResult = await applyZipFilesToPage(tab.id, cleanedFiles);
+    debugLog("Starting sequential upload", {
+      totalFiles: sortedFiles.length,
+      page: tab.url
+    });
 
-    if (!uploadResult.isSupportedPage) {
-      throw new Error(uploadResult.errorMessage || "Open a Tebex editor page before uploading.");
+    const aggregateResult = {
+      isSupportedPage: true,
+      totalRequested: sortedFiles.length,
+      matchedCount: 0,
+      uploadedCount: 0,
+      uploadedFiles: [],
+      failedFiles: [],
+      blockedSwitchPrompts: 0
+    };
+
+    for (let i = 0; i < sortedFiles.length; i += 1) {
+      const fileName = sortedFiles[i];
+      const percent = 40 + ((i + 1) / sortedFiles.length) * 58;
+      setProgress(percent);
+      setStatus(`Uploading ${i + 1}/${sortedFiles.length}: ${fileName}`);
+      debugLog(`Uploading file ${i + 1}/${sortedFiles.length}: ${fileName}`);
+
+      const singlePayload = {
+        [fileName]: cleanedFiles[fileName]
+      };
+
+      const singleResult = await applyZipFilesToPage(tab.id, singlePayload, {
+        timeoutMs: 35000,
+        tryAllFrames: false,
+        label: `Upload ${fileName}`
+      });
+      emitUploadDebugLogs(singleResult, fileName);
+
+      if (!singleResult.isSupportedPage) {
+        debugLog(`Upload failed for ${fileName}`, singleResult);
+        aggregateResult.failedFiles.push({
+          file: fileName,
+          reason: singleResult.errorMessage || "Unsupported page or script error."
+        });
+        continue;
+      }
+
+      const matchedCount = Number(singleResult.matchedCount || 0);
+      const uploadedCount = Number(singleResult.uploadedCount || 0);
+      aggregateResult.matchedCount += matchedCount;
+      aggregateResult.blockedSwitchPrompts += Number(singleResult.blockedSwitchPrompts || 0);
+
+      if (uploadedCount > 0 && Array.isArray(singleResult.uploadedFiles)) {
+        const matchingUploaded = singleResult.uploadedFiles.filter(
+          (item) => item && normalizePath(item.file) === fileName
+        );
+        if (matchingUploaded.length > 0) {
+          aggregateResult.uploadedFiles.push(...matchingUploaded);
+          aggregateResult.uploadedCount += matchingUploaded.length;
+          debugLog(`Upload succeeded for ${fileName}`, matchingUploaded[0]);
+          continue;
+        }
+      }
+
+      const matchingFailure =
+        Array.isArray(singleResult.failedFiles) &&
+        singleResult.failedFiles.find(
+          (item) => item && normalizePath(item.file) === fileName
+        );
+      const reason =
+        (matchingFailure && matchingFailure.reason) ||
+        singleResult.errorMessage ||
+        "File upload returned no success result.";
+      aggregateResult.failedFiles.push({ file: fileName, reason });
+      debugLog(`Upload failed for ${fileName}: ${reason}`);
     }
 
-    renderUploadSummary(uploadResult);
+    renderUploadSummary(aggregateResult);
 
-    const uploadedCount = Number(uploadResult.uploadedCount || 0);
+    const uploadedCount = Number(aggregateResult.uploadedCount || 0);
     if (uploadedCount === 0) {
       throw new Error(
         "No files were uploaded. Keep the Tebex template/file tree visible, then try again."
@@ -618,7 +731,7 @@ async function importFromZip(zipFile) {
     }
 
     setProgress(100);
-    const blockedPrompts = Number(uploadResult.blockedSwitchPrompts || 0);
+    const blockedPrompts = Number(aggregateResult.blockedSwitchPrompts || 0);
     if (blockedPrompts > 0) {
       setStatus(
         `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s). Blocked ${blockedPrompts} unsaved switch prompt(s).`
@@ -628,10 +741,12 @@ async function importFromZip(zipFile) {
         `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s) from ZIP.`
       );
     }
+    debugLog("Upload completed", aggregateResult);
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     setStatus(`Upload failed: ${message}`);
     addFileLine(`Error: ${message}`, true);
+    debugLog("Upload aborted with error", error);
     setProgress(0);
   } finally {
     setControlsDisabled(false);
@@ -1467,6 +1582,24 @@ async function applyTemplatesInPage(filesByPath) {
   const FILE_REGEX = /([A-Za-z0-9_./-]+\.(?:html|twig|js|css))/gi;
   const host = String(window.location.hostname || "").toLowerCase();
   const isSupportedPage = host.includes("tebex.io") || host.includes("buildersoftware.com");
+  const debugLogs = [];
+
+  function log(message, data) {
+    const line =
+      typeof data === "undefined"
+        ? `[TebexUploader] ${message}`
+        : `[TebexUploader] ${message} ${JSON.stringify(data)}`;
+    debugLogs.push(line);
+    try {
+      if (typeof data === "undefined") {
+        console.log(line);
+      } else {
+        console.log(line, data);
+      }
+    } catch (_error) {
+      // Ignore logging errors.
+    }
+  }
 
   if (!isSupportedPage) {
     return {
@@ -1476,7 +1609,8 @@ async function applyTemplatesInPage(filesByPath) {
       matchedCount: 0,
       uploadedCount: 0,
       uploadedFiles: [],
-      failedFiles: []
+      failedFiles: [],
+      logs: debugLogs
     };
   }
 
@@ -2326,6 +2460,11 @@ async function applyTemplatesInPage(filesByPath) {
       .filter(([path]) => isTemplatePath(path) && isLikelyEditorFilePath(path))
       .sort((a, b) => a[0].localeCompare(b[0]));
 
+    log("Upload script started", {
+      url: window.location.href,
+      totalRequested: requestedEntries.length
+    });
+
     const uploadedFiles = [];
     const failedFiles = [];
     let matchedCount = 0;
@@ -2341,6 +2480,10 @@ async function applyTemplatesInPage(filesByPath) {
       }
 
       if (!nodeMatch.element) {
+        log("File match failed", {
+          file: filePath,
+          reason: nodeMatch.reason || "No matching file entry found in Tebex file tree."
+        });
         failedFiles.push({
           file: filePath,
           reason: nodeMatch.reason || "No matching file entry found in Tebex file tree."
@@ -2349,6 +2492,11 @@ async function applyTemplatesInPage(filesByPath) {
       }
 
       matchedCount += 1;
+      log("File matched", {
+        file: filePath,
+        matchType: nodeMatch.matchType,
+        matchedPath: nodeMatch.matchedPath || null
+      });
 
       try {
         const currentlyActive = getActiveFileName();
@@ -2357,8 +2505,18 @@ async function applyTemplatesInPage(filesByPath) {
           currentlyActive &&
           !activeNameMatchesTarget(currentlyActive, filePath, maps)
         ) {
+          log("Pre-switch save required", {
+            currentFile: currentlyActive,
+            targetFile: filePath
+          });
           const preSwitchSave = await triggerSaveForFile(currentlyActive, maps);
           if (!preSwitchSave.ok) {
+            log("Pre-switch save failed", {
+              file: filePath,
+              reason:
+                preSwitchSave.reason ||
+                `Current file ${currentlyActive} is unsaved and could not be saved before switching.`
+            });
             failedFiles.push({
               file: filePath,
               reason:
@@ -2367,6 +2525,10 @@ async function applyTemplatesInPage(filesByPath) {
             });
             continue;
           }
+          log("Pre-switch save succeeded", {
+            currentFile: currentlyActive,
+            method: preSwitchSave.method
+          });
           await wait(260);
         }
 
@@ -2378,9 +2540,19 @@ async function applyTemplatesInPage(filesByPath) {
         let promptCountBefore = blockedSwitchPrompts;
         fireClick(node);
         if (blockedSwitchPrompts > promptCountBefore) {
+          log("Switch prompt blocked, retrying save", {
+            file: filePath,
+            blockedCount: blockedSwitchPrompts
+          });
           const activeName = getActiveFileName() || currentlyActive || filePath;
           const preRetrySave = await triggerSaveForFile(activeName, maps);
           if (!preRetrySave.ok) {
+            log("Retry save failed after blocked prompt", {
+              file: filePath,
+              reason:
+                preRetrySave.reason ||
+                `Unsaved-change prompt blocked switch while opening ${filePath}.`
+            });
             failedFiles.push({
               file: filePath,
               reason:
@@ -2393,6 +2565,7 @@ async function applyTemplatesInPage(filesByPath) {
           promptCountBefore = blockedSwitchPrompts;
           fireClick(node);
           if (blockedSwitchPrompts > promptCountBefore) {
+            log("Switch blocked again after retry save", { file: filePath });
             failedFiles.push({
               file: filePath,
               reason: `Switch to ${filePath} still blocked by unsaved changes after save retry.`
@@ -2419,6 +2592,7 @@ async function applyTemplatesInPage(filesByPath) {
         }
 
         if (!confirmedActive) {
+          log("Target file activation could not be confirmed", { file: filePath });
           failedFiles.push({
             file: filePath,
             reason: "Could not confirm the exact target file/directory became active."
@@ -2428,21 +2602,31 @@ async function applyTemplatesInPage(filesByPath) {
 
         const writeMethod = writeEditorContent(content);
         if (!writeMethod) {
+          log("Write failed: no editor detected", { file: filePath });
           failedFiles.push({
             file: filePath,
             reason: "Could not find a writable editor instance after opening file."
           });
           continue;
         }
+        log("Content written", { file: filePath, method: writeMethod });
 
         const saveResult = await triggerSaveForFile(filePath, maps);
         if (!saveResult.ok) {
+          log("Save verification failed", {
+            file: filePath,
+            reason: saveResult.reason || "Save verification failed."
+          });
           failedFiles.push({
             file: filePath,
             reason: saveResult.reason || "Save verification failed."
           });
           continue;
         }
+        log("Save succeeded", {
+          file: filePath,
+          method: saveResult.method
+        });
 
         uploadedFiles.push({
           file: filePath,
@@ -2450,12 +2634,22 @@ async function applyTemplatesInPage(filesByPath) {
           saveMethod: saveResult.method
         });
       } catch (error) {
+        log("Unhandled upload error for file", {
+          file: filePath,
+          reason: error && error.message ? error.message : "Unknown upload error."
+        });
         failedFiles.push({
           file: filePath,
           reason: error && error.message ? error.message : "Unknown upload error."
         });
       }
     }
+
+    log("Upload script completed", {
+      uploaded: uploadedFiles.length,
+      failed: failedFiles.length,
+      blockedSwitchPrompts
+    });
 
     return {
       isSupportedPage: true,
@@ -2465,7 +2659,8 @@ async function applyTemplatesInPage(filesByPath) {
       uploadedCount: uploadedFiles.length,
       uploadedFiles,
       failedFiles,
-      blockedSwitchPrompts
+      blockedSwitchPrompts,
+      logs: debugLogs
     };
   } finally {
     for (const patch of confirmPatches) {
