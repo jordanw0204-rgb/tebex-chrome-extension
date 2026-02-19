@@ -615,6 +615,42 @@ async function extractTebexFilesInPage(defaultFiles) {
     return segments.slice(0, -1).join("/");
   }
 
+  function strictPathMatch(targetPath, candidatePath) {
+    const target = normalizeFileName(targetPath).toLowerCase();
+    const candidate = normalizeFileName(candidatePath).toLowerCase();
+    if (!target || !candidate) {
+      return false;
+    }
+    if (target === candidate) {
+      return true;
+    }
+    return candidate.endsWith("/" + target);
+  }
+
+  function isSameFileName(a, b) {
+    const left = normalizeFileName(a).toLowerCase();
+    const right = normalizeFileName(b).toLowerCase();
+    if (!left || !right) {
+      return false;
+    }
+    if (left === right) {
+      return true;
+    }
+    if (left.endsWith("/" + right) || right.endsWith("/" + left)) {
+      return true;
+    }
+    return getBaseName(left) === getBaseName(right);
+  }
+
+  function getParentDir(path) {
+    const normalized = normalizeFileName(path).toLowerCase();
+    const segments = normalized.split("/");
+    if (segments.length <= 1) {
+      return "";
+    }
+    return segments.slice(0, -1).join("/");
+  }
+
   function isSameFileName(a, b) {
     const left = normalizeFileName(a).toLowerCase();
     const right = normalizeFileName(b).toLowerCase();
@@ -1485,6 +1521,33 @@ async function applyTemplatesInPage(filesByPath) {
     );
   }
 
+  function hasFileNodeHints(element) {
+    if (!element || !(element instanceof Element)) {
+      return false;
+    }
+
+    if (
+      element.hasAttribute("data-filename") ||
+      element.hasAttribute("data-file") ||
+      element.hasAttribute("data-path") ||
+      element.hasAttribute("data-name")
+    ) {
+      return true;
+    }
+
+    const role = String(element.getAttribute("role") || "").toLowerCase();
+    if (role === "tab" || role === "treeitem" || role === "option") {
+      return true;
+    }
+
+    const classHint = String(element.className || "").toLowerCase();
+    if (/file|template|editor|tree|sidebar|list-item/.test(classHint)) {
+      return true;
+    }
+
+    return false;
+  }
+
   function fireClick(element) {
     element.dispatchEvent(
       new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window })
@@ -1521,6 +1584,57 @@ async function applyTemplatesInPage(filesByPath) {
     );
   }
 
+  function getActiveFileNode() {
+    const selectors = [
+      '[role="tab"][aria-selected="true"]',
+      '[role="treeitem"][aria-selected="true"]',
+      '[aria-current="true"]',
+      ".active",
+      ".is-active",
+      ".selected"
+    ];
+
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      if (node) {
+        return node;
+      }
+    }
+    return null;
+  }
+
+  function getActiveFileName() {
+    const activeNode = getActiveFileNode();
+    if (!activeNode) {
+      return null;
+    }
+    const names = collectNamesFromElement(activeNode);
+    return names.length > 0 ? names[0] : null;
+  }
+
+  function activeFileLooksDirty() {
+    const node = getActiveFileNode();
+    if (!node) {
+      return null;
+    }
+    const label = [
+      node.textContent,
+      node.getAttribute("title"),
+      node.getAttribute("aria-label"),
+      node.className
+    ]
+      .filter(Boolean)
+      .join(" ");
+    if (!label) {
+      return null;
+    }
+    const normalized = label.toLowerCase();
+    if (/\*/.test(label) || /\bunsaved\b/.test(normalized) || /\bdirty\b/.test(normalized)) {
+      return true;
+    }
+    return false;
+  }
+
   function collectTreeMaps() {
     const exactMap = new Map();
     const lowerMap = new Map();
@@ -1542,6 +1656,9 @@ async function applyTemplatesInPage(filesByPath) {
       if (!isProbablyClickable(candidate)) {
         continue;
       }
+      if (!hasFileNodeHints(element) && !hasFileNodeHints(candidate)) {
+        continue;
+      }
 
       const names = [
         ...collectNamesFromElement(element),
@@ -1557,16 +1674,48 @@ async function applyTemplatesInPage(filesByPath) {
           continue;
         }
 
+        const normalizedLower = normalizedName.toLowerCase();
+        const label = [
+          candidate.textContent,
+          candidate.getAttribute("title"),
+          candidate.getAttribute("aria-label"),
+          element.textContent,
+          element.getAttribute("title"),
+          element.getAttribute("aria-label")
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        let score = 0;
+        if (isVisible(candidate)) {
+          score += 100;
+        }
+        if (label.includes(normalizedLower)) {
+          score += 40;
+        }
+        if (label.includes(getBaseName(normalizedLower))) {
+          score += 25;
+        }
+        if (candidate.getAttribute("aria-selected") === "true") {
+          score += 20;
+        }
+
         const existing = exactMap.get(normalizedName);
         if (!existing || (!isVisible(existing) && isVisible(candidate))) {
           exactMap.set(normalizedName, candidate);
-          lowerMap.set(normalizedName.toLowerCase(), candidate);
+          lowerMap.set(normalizedLower, candidate);
         }
 
         const base = getBaseName(normalizedName).toLowerCase();
         const list = baseMap.get(base) || [];
-        if (!list.some((item) => item.path === normalizedName && item.element === candidate)) {
-          list.push({ path: normalizedName, element: candidate });
+        if (!list.some((item) => item.pathLower === normalizedLower && item.element === candidate)) {
+          list.push({
+            path: normalizedName,
+            pathLower: normalizedLower,
+            dirLower: getParentDir(normalizedLower),
+            element: candidate,
+            score
+          });
           baseMap.set(base, list);
         }
       }
@@ -1578,45 +1727,94 @@ async function applyTemplatesInPage(filesByPath) {
   function findNodeForFile(filePath, maps) {
     const normalizedPath = normalizeFileName(filePath);
     const lowerPath = normalizedPath.toLowerCase();
+    const targetDir = getParentDir(lowerPath);
+    const targetBase = getBaseName(lowerPath);
 
     if (maps.exactMap.has(normalizedPath)) {
-      return maps.exactMap.get(normalizedPath);
+      return {
+        element: maps.exactMap.get(normalizedPath),
+        matchedPath: normalizedPath,
+        matchType: "exact"
+      };
     }
     if (maps.lowerMap.has(lowerPath)) {
-      return maps.lowerMap.get(lowerPath);
+      return {
+        element: maps.lowerMap.get(lowerPath),
+        matchedPath: lowerPath,
+        matchType: "exact-ci"
+      };
     }
 
+    const suffixMatches = [];
     for (const [knownPath, element] of maps.exactMap.entries()) {
       const lowerKnown = knownPath.toLowerCase();
-      if (lowerKnown.endsWith(`/${lowerPath}`) || lowerPath.endsWith(`/${lowerKnown}`)) {
-        return element;
+      if (strictPathMatch(lowerPath, lowerKnown)) {
+        suffixMatches.push({ path: knownPath, pathLower: lowerKnown, element });
       }
     }
+    if (suffixMatches.length === 1) {
+      return {
+        element: suffixMatches[0].element,
+        matchedPath: suffixMatches[0].path,
+        matchType: "suffix"
+      };
+    }
+    if (suffixMatches.length > 1) {
+      return {
+        element: null,
+        reason: `Ambiguous path match for ${normalizedPath}. Multiple directories matched.`,
+        matchType: "ambiguous-suffix"
+      };
+    }
 
-    const base = getBaseName(normalizedPath).toLowerCase();
-    const candidates = maps.baseMap.get(base) || [];
+    const candidates = (maps.baseMap.get(targetBase) || []).slice();
     if (candidates.length === 1) {
-      return candidates[0].element;
+      const only = candidates[0];
+      if (!targetDir || only.dirLower === targetDir) {
+        return {
+          element: only.element,
+          matchedPath: only.path,
+          matchType: "basename-unique"
+        };
+      }
+      return {
+        element: null,
+        reason: `Directory mismatch for ${normalizedPath}. Found ${only.path}.`,
+        matchType: "dir-mismatch"
+      };
     }
 
     if (candidates.length > 1) {
-      const parentDir = lowerPath.includes("/")
-        ? lowerPath.split("/").slice(0, -1).join("/")
-        : "";
-      const directoryMatches = candidates.filter((candidate) =>
-        candidate.path.toLowerCase().includes(parentDir)
+      const exactDirMatches = candidates.filter((candidate) =>
+        candidate.dirLower === targetDir
       );
-      if (directoryMatches.length === 1) {
-        return directoryMatches[0].element;
+      if (exactDirMatches.length === 1) {
+        return {
+          element: exactDirMatches[0].element,
+          matchedPath: exactDirMatches[0].path,
+          matchType: "basename-dir"
+        };
+      }
+      if (exactDirMatches.length > 1) {
+        return {
+          element: null,
+          reason: `Ambiguous file in directory for ${normalizedPath}.`,
+          matchType: "ambiguous-dir"
+        };
       }
 
-      const visibleCandidates = candidates.filter((candidate) => isVisible(candidate.element));
-      if (visibleCandidates.length > 0) {
-        return visibleCandidates[0].element;
-      }
+      return {
+        element: null,
+        reason: `Ambiguous filename for ${normalizedPath}. Multiple directories contain ${targetBase}.`,
+        matchType: "ambiguous-base"
+      };
     }
 
-    return null;
+    return {
+      element: null,
+      reason: `No matching file entry found for ${normalizedPath}.`,
+      matchType: "missing"
+    };
   }
 
   function pickMonacoEditor() {
@@ -1812,23 +2010,24 @@ async function applyTemplatesInPage(filesByPath) {
     return null;
   }
 
-  function triggerSave() {
-    let saveMethod = "shortcut";
-    const saveTokens = ["save"];
-    const interactiveElements = Array.from(
-      document.querySelectorAll("button, [role='button'], a, [title], [aria-label]")
+  function findSaveControls() {
+    const candidates = Array.from(
+      document.querySelectorAll(
+        "button, [role='button'], [type='submit'], a, [title], [aria-label], [data-action], [data-testid]"
+      )
     );
 
-    for (const element of interactiveElements) {
+    const saveControls = [];
+    for (const element of candidates) {
       if (!isVisible(element)) {
         continue;
       }
-
       const text = [
         element.textContent,
         element.getAttribute("title"),
         element.getAttribute("aria-label"),
         element.getAttribute("data-action"),
+        element.getAttribute("data-testid"),
         element.id,
         element.className
       ]
@@ -1836,47 +2035,137 @@ async function applyTemplatesInPage(filesByPath) {
         .join(" ")
         .toLowerCase();
 
-      if (saveTokens.some((token) => text.includes(token))) {
+      if (!/\bsave\b/.test(text)) {
+        continue;
+      }
+
+      let score = 0;
+      if (element.tagName.toLowerCase() === "button") {
+        score += 15;
+      }
+      if (element.getAttribute("type") === "submit") {
+        score += 10;
+      }
+      if (/\bsave\b/.test(text)) {
+        score += 20;
+      }
+      if (/publish|update|apply/.test(text)) {
+        score += 4;
+      }
+      if (element.disabled || element.getAttribute("aria-disabled") === "true") {
+        score -= 30;
+      }
+
+      saveControls.push({ element, score });
+    }
+
+    saveControls.sort((a, b) => b.score - a.score);
+    return saveControls.map((item) => item.element);
+  }
+
+  function dispatchSaveShortcut(ctrlKey, metaKey, target) {
+    const eventInit = {
+      key: "s",
+      code: "KeyS",
+      bubbles: true,
+      cancelable: true,
+      ctrlKey,
+      metaKey
+    };
+
+    const targets = [target, document.activeElement, document, window].filter(Boolean);
+    for (const currentTarget of targets) {
+      try {
+        currentTarget.dispatchEvent(new KeyboardEvent("keydown", eventInit));
+        currentTarget.dispatchEvent(new KeyboardEvent("keypress", eventInit));
+        currentTarget.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+      } catch (_error) {
+        // Keep trying remaining targets.
+      }
+    }
+  }
+
+  function activeNameMatchesTarget(activeName, targetPath, maps) {
+    if (!activeName) {
+      return false;
+    }
+
+    if (strictPathMatch(targetPath, activeName) || strictPathMatch(activeName, targetPath)) {
+      return true;
+    }
+
+    const activeBase = getBaseName(activeName).toLowerCase();
+    const targetBase = getBaseName(targetPath).toLowerCase();
+    if (activeBase !== targetBase) {
+      return false;
+    }
+
+    const sameBaseCandidates = maps.baseMap.get(activeBase) || [];
+    return sameBaseCandidates.length === 1;
+  }
+
+  async function triggerSaveForFile(targetPath, maps) {
+    let saveMethod = "shortcut";
+    const target =
+      document.activeElement && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : document.body;
+    const saveControls = findSaveControls();
+    const dirtyBefore = activeFileLooksDirty();
+    let lastDirtyState = dirtyBefore;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      dispatchSaveShortcut(true, false, target);
+      dispatchSaveShortcut(false, true, target);
+      await wait(80);
+
+      let clicked = false;
+      for (const control of saveControls.slice(0, 3)) {
         try {
-          fireClick(element);
-          saveMethod = "button";
+          fireClick(control);
+          if (typeof control.click === "function") {
+            control.click();
+          }
+          clicked = true;
           break;
         } catch (_error) {
-          // Continue to keyboard shortcut.
+          // Try next save control.
         }
+      }
+
+      if (clicked) {
+        saveMethod = "button+shortcut";
+      } else if (attempt > 0) {
+        saveMethod = "shortcut-retry";
+      }
+
+      await wait(170);
+
+      const activeName = getActiveFileName();
+      if (activeName && !activeNameMatchesTarget(activeName, targetPath, maps)) {
+        return {
+          ok: false,
+          method: saveMethod,
+          reason: `Active file switched to ${activeName} while saving ${targetPath}.`
+        };
+      }
+
+      const dirtyAfter = activeFileLooksDirty();
+      lastDirtyState = dirtyAfter;
+      if (dirtyAfter === false || (dirtyBefore === null && attempt >= 1)) {
+        return { ok: true, method: saveMethod };
       }
     }
 
-    const dispatchShortcut = (ctrlKey, metaKey) => {
-      const target =
-        document.activeElement && document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : document.body;
-      target.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          key: "s",
-          code: "KeyS",
-          bubbles: true,
-          cancelable: true,
-          ctrlKey,
-          metaKey
-        })
-      );
-      target.dispatchEvent(
-        new KeyboardEvent("keyup", {
-          key: "s",
-          code: "KeyS",
-          bubbles: true,
-          cancelable: true,
-          ctrlKey,
-          metaKey
-        })
-      );
-    };
+    if (lastDirtyState === true) {
+      return {
+        ok: false,
+        method: saveMethod,
+        reason: `Save did not clear dirty state for ${targetPath}.`
+      };
+    }
 
-    dispatchShortcut(true, false);
-    dispatchShortcut(false, true);
-    return saveMethod;
+    return { ok: true, method: saveMethod };
   }
 
   const requestedEntries = Object.entries(filesByPath || {})
@@ -1890,18 +2179,18 @@ async function applyTemplatesInPage(filesByPath) {
 
   for (const [filePath, content] of requestedEntries) {
     let maps = collectTreeMaps();
-    let node = findNodeForFile(filePath, maps);
+    let nodeMatch = findNodeForFile(filePath, maps);
 
-    if (!node) {
+    if (!nodeMatch.element) {
       await wait(120);
       maps = collectTreeMaps();
-      node = findNodeForFile(filePath, maps);
+      nodeMatch = findNodeForFile(filePath, maps);
     }
 
-    if (!node) {
+    if (!nodeMatch.element) {
       failedFiles.push({
         file: filePath,
-        reason: "No matching file entry found in Tebex file tree."
+        reason: nodeMatch.reason || "No matching file entry found in Tebex file tree."
       });
       continue;
     }
@@ -1909,12 +2198,36 @@ async function applyTemplatesInPage(filesByPath) {
     matchedCount += 1;
 
     try {
+      const node = nodeMatch.element;
       if (isVisible(node)) {
         node.scrollIntoView({ block: "center", inline: "nearest" });
       }
 
       fireClick(node);
-      await wait(200);
+      let confirmedActive = false;
+      for (let attempt = 0; attempt < 7; attempt += 1) {
+        await wait(attempt < 3 ? 110 : 170);
+        const activeName = getActiveFileName();
+        if (!activeName) {
+          if (attempt >= 3 && (nodeMatch.matchType === "exact" || nodeMatch.matchType === "suffix")) {
+            confirmedActive = true;
+            break;
+          }
+          continue;
+        }
+        if (activeNameMatchesTarget(activeName, filePath, maps)) {
+          confirmedActive = true;
+          break;
+        }
+      }
+
+      if (!confirmedActive) {
+        failedFiles.push({
+          file: filePath,
+          reason: "Could not confirm the exact target file/directory became active."
+        });
+        continue;
+      }
 
       const writeMethod = writeEditorContent(content);
       if (!writeMethod) {
@@ -1925,13 +2238,19 @@ async function applyTemplatesInPage(filesByPath) {
         continue;
       }
 
-      const saveMethod = triggerSave();
-      await wait(220);
+      const saveResult = await triggerSaveForFile(filePath, maps);
+      if (!saveResult.ok) {
+        failedFiles.push({
+          file: filePath,
+          reason: saveResult.reason || "Save verification failed."
+        });
+        continue;
+      }
 
       uploadedFiles.push({
         file: filePath,
         method: writeMethod,
-        saveMethod
+        saveMethod: saveResult.method
       });
     } catch (error) {
       failedFiles.push({
