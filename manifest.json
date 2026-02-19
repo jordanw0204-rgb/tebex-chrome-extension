@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Tebex File Downloader",
+  "version": "2.4",
+  "description": "Export and import Tebex webstore templates using ZIP files",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://tebex.io/*",
+    "https://*.tebex.io/*",
+    "https://*.buildersoftware.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Import/Export Tebex templates via ZIP"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
+

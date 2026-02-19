@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 450px;
+      padding: 15px;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      margin: 0;
+    }
+
+    .container {
+      background: #fff;
+      border-radius: 12px;
+      padding: 25px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+    }
+
+    h1 {
+      margin: 0 0 10px 0;
+      font-size: 22px;
+      color: #333;
+    }
+
+    .subtitle {
+      margin-bottom: 20px;
+      font-size: 12px;
+      color: #666;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    button {
+      flex: 1;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: bold;
+      transition: all 0.3s ease;
+    }
+
+    #downloadBtn {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: #fff;
+    }
+
+    #downloadBtn:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+    }
+
+    #uploadBtn {
+      background: linear-gradient(135deg, #2bb673 0%, #1f9d63 100%);
+      color: #fff;
+    }
+
+    #uploadBtn:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(43, 182, 115, 0.35);
+    }
+
+    #clearBtn {
+      background: #f0f0f0;
+      color: #333;
+    }
+
+    #clearBtn:hover {
+      background: #e0e0e0;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    #status {
+      padding: 14px;
+      background: linear-gradient(135deg, #e3f2fd 0%, #f3e5f5 100%);
+      border-left: 5px solid #667eea;
+      border-radius: 6px;
+      margin-bottom: 15px;
+      min-height: 45px;
+      display: flex;
+      align-items: center;
+      color: #333;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    #fileList {
+      max-height: 350px;
+      overflow-y: auto;
+      background: #f9f9f9;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 15px;
+    }
+
+    .file-item {
+      padding: 10px;
+      background: #fff;
+      margin-bottom: 6px;
+      border-radius: 6px;
+      border-left: 3px solid #4caf50;
+      font-size: 12px;
+      color: #333;
+      font-family: "Courier New", monospace;
+    }
+
+    .file-item.error {
+      border-left-color: #f44336;
+      color: #f44336;
+      background: #ffebee;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: #e0e0e0;
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 15px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+      width: 0%;
+      transition: width 0.2s ease;
+      border-radius: 10px;
+    }
+
+    .info-box {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-top: 15px;
+      font-size: 12px;
+      color: #856404;
+      line-height: 1.5;
+    }
+
+    #fileList::-webkit-scrollbar {
+      width: 6px;
+    }
+
+    #fileList::-webkit-scrollbar-track {
+      background: #f1f1f1;
+      border-radius: 10px;
+    }
+
+    #fileList::-webkit-scrollbar-thumb {
+      background: #888;
+      border-radius: 10px;
+    }
+
+    #fileList::-webkit-scrollbar-thumb:hover {
+      background: #555;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Tebex Downloader</h1>
+    <p class="subtitle">Export templates/assets to ZIP, or upload ZIP back into Tebex editor</p>
+
+    <div class="button-group">
+      <button id="downloadBtn">Download ZIP</button>
+      <button id="uploadBtn">Upload ZIP</button>
+      <button id="clearBtn">Clear</button>
+    </div>
+
+    <input id="zipInput" type="file" accept=".zip,application/zip" style="display: none;">
+
+    <div id="status">Ready to export or import Tebex files.</div>
+
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+
+    <div id="fileList"></div>
+
+    <div class="info-box">
+      This version exports one file: <strong>tebex-templates-YYYY-MM-DD.zip</strong>.<br>
+      Upload accepts a ZIP with the same folder layout and writes each file into the matching Tebex file.
+    </div>
+  </div>
+
+  <script src="vendor/jszip.min.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
