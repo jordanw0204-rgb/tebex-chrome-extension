@@ -479,13 +479,28 @@ function renderUploadSummary(result) {
 }
 
 async function applyZipFilesToPage(tabId, filesByPath) {
+  function withTimeout(promise, timeoutMs, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        window.setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms.`));
+        }, timeoutMs);
+      })
+    ]);
+  }
+
   async function runApply(allFrames) {
-    const injection = await chrome.scripting.executeScript({
-      target: { tabId, allFrames },
-      world: "MAIN",
-      func: applyTemplatesInPage,
-      args: [filesByPath]
-    });
+    const injection = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames },
+        world: "MAIN",
+        func: applyTemplatesInPage,
+        args: [filesByPath]
+      }),
+      90000,
+      "Upload script"
+    );
 
     if (!Array.isArray(injection) || injection.length === 0) {
       throw new Error("Failed to run uploader script in the active tab.");
@@ -2264,18 +2279,45 @@ async function applyTemplatesInPage(filesByPath) {
     return { ok: true, method: saveMethod };
   }
 
-  const originalConfirm =
-    typeof window.confirm === "function" ? window.confirm.bind(window) : null;
+  const confirmPatches = [];
   let blockedSwitchPrompts = 0;
-  if (originalConfirm) {
-    window.confirm = (message) => {
+
+  function patchConfirm(targetWindow) {
+    if (!targetWindow || typeof targetWindow.confirm !== "function") {
+      return;
+    }
+
+    const original = targetWindow.confirm.bind(targetWindow);
+    const patched = (message) => {
       const text = String(message || "").toLowerCase();
-      if (text.includes("unsaved") || text.includes("different page")) {
+      if (
+        text.includes("unsaved") ||
+        text.includes("different page") ||
+        text.includes("leave site")
+      ) {
         blockedSwitchPrompts += 1;
         return false;
       }
-      return originalConfirm(message);
+      return original(message);
     };
+
+    try {
+      targetWindow.confirm = patched;
+      if (targetWindow.confirm === patched) {
+        confirmPatches.push({ targetWindow, original });
+      }
+    } catch (_error) {
+      // Ignore non-writable confirm.
+    }
+  }
+
+  patchConfirm(window);
+  try {
+    if (window.top && window.top !== window) {
+      patchConfirm(window.top);
+    }
+  } catch (_error) {
+    // Cross-origin top window.
   }
 
   try {
@@ -2426,8 +2468,12 @@ async function applyTemplatesInPage(filesByPath) {
       blockedSwitchPrompts
     };
   } finally {
-    if (originalConfirm) {
-      window.confirm = originalConfirm;
+    for (const patch of confirmPatches) {
+      try {
+        patch.targetWindow.confirm = patch.original;
+      } catch (_error) {
+        // Ignore restore failures.
+      }
     }
   }
 }
