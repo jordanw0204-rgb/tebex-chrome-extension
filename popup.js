@@ -685,54 +685,60 @@ async function importFromZip(zipFile) {
       const singlePayload = {
         [fileName]: cleanedFiles[fileName]
       };
-
-      const singleResult = await applyZipFilesToPage(tab.id, singlePayload, {
-        timeoutMs: 35000,
-        tryAllFrames: false,
-        label: `Upload ${fileName}`
-      });
-      emitUploadDebugLogs(singleResult, fileName);
-
-      if (!singleResult.isSupportedPage) {
-        debugLog(`Upload failed for ${fileName}`, singleResult);
-        aggregateResult.failedFiles.push({
-          file: fileName,
-          reason: singleResult.errorMessage || "Unsupported page or script error."
+      try {
+        const singleResult = await applyZipFilesToPage(tab.id, singlePayload, {
+          timeoutMs: 45000,
+          tryAllFrames: false,
+          label: `Upload ${fileName}`
         });
-        continue;
-      }
+        emitUploadDebugLogs(singleResult, fileName);
 
-      const matchedCount = Number(singleResult.matchedCount || 0);
-      const uploadedCount = Number(singleResult.uploadedCount || 0);
-      aggregateResult.matchedCount += matchedCount;
-      aggregateResult.blockedSwitchPrompts += Number(singleResult.blockedSwitchPrompts || 0);
-      if (Array.isArray(singleResult.blockedAlertMessages)) {
-        aggregateResult.blockedAlertMessages.push(...singleResult.blockedAlertMessages);
-      }
-
-      if (uploadedCount > 0 && Array.isArray(singleResult.uploadedFiles)) {
-        const matchingUploaded = singleResult.uploadedFiles.filter(
-          (item) => item && normalizePath(item.file) === fileName
-        );
-        if (matchingUploaded.length > 0) {
-          aggregateResult.uploadedFiles.push(...matchingUploaded);
-          aggregateResult.uploadedCount += matchingUploaded.length;
-          debugLog(`Upload succeeded for ${fileName}`, matchingUploaded[0]);
+        if (!singleResult.isSupportedPage) {
+          debugLog(`Upload failed for ${fileName}`, singleResult);
+          aggregateResult.failedFiles.push({
+            file: fileName,
+            reason: singleResult.errorMessage || "Unsupported page or script error."
+          });
           continue;
         }
-      }
 
-      const matchingFailure =
-        Array.isArray(singleResult.failedFiles) &&
-        singleResult.failedFiles.find(
-          (item) => item && normalizePath(item.file) === fileName
-        );
-      const reason =
-        (matchingFailure && matchingFailure.reason) ||
-        singleResult.errorMessage ||
-        "File upload returned no success result.";
-      aggregateResult.failedFiles.push({ file: fileName, reason });
-      debugLog(`Upload failed for ${fileName}: ${reason}`);
+        const matchedCount = Number(singleResult.matchedCount || 0);
+        const uploadedCount = Number(singleResult.uploadedCount || 0);
+        aggregateResult.matchedCount += matchedCount;
+        aggregateResult.blockedSwitchPrompts += Number(singleResult.blockedSwitchPrompts || 0);
+        if (Array.isArray(singleResult.blockedAlertMessages)) {
+          aggregateResult.blockedAlertMessages.push(...singleResult.blockedAlertMessages);
+        }
+
+        if (uploadedCount > 0 && Array.isArray(singleResult.uploadedFiles)) {
+          const matchingUploaded = singleResult.uploadedFiles.filter(
+            (item) => item && normalizePath(item.file) === fileName
+          );
+          if (matchingUploaded.length > 0) {
+            aggregateResult.uploadedFiles.push(...matchingUploaded);
+            aggregateResult.uploadedCount += matchingUploaded.length;
+            debugLog(`Upload succeeded for ${fileName}`, matchingUploaded[0]);
+            continue;
+          }
+        }
+
+        const matchingFailure =
+          Array.isArray(singleResult.failedFiles) &&
+          singleResult.failedFiles.find(
+            (item) => item && normalizePath(item.file) === fileName
+          );
+        const reason =
+          (matchingFailure && matchingFailure.reason) ||
+          singleResult.errorMessage ||
+          "File upload returned no success result.";
+        aggregateResult.failedFiles.push({ file: fileName, reason });
+        debugLog(`Upload failed for ${fileName}: ${reason}`);
+      } catch (error) {
+        const reason = error && error.message ? error.message : String(error);
+        aggregateResult.failedFiles.push({ file: fileName, reason });
+        debugLog(`Upload exception for ${fileName}: ${reason}`);
+        addFileLine(`MISS ${fileName} - ${reason}`, true);
+      }
     }
 
     aggregateResult.blockedAlertMessages = Array.from(
@@ -2441,7 +2447,7 @@ async function applyTemplatesInPage(filesByPath) {
 
     async function waitForSettle(maxMs) {
       let elapsed = 0;
-      const step = 150;
+      const step = 220;
       while (elapsed < maxMs) {
         await wait(step);
         elapsed += step;
@@ -2467,57 +2473,50 @@ async function applyTemplatesInPage(filesByPath) {
       return { ok: false };
     }
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      if (attempt === 0) {
-        log("Save attempt via keyboard", { file: targetPath, attempt: attempt + 1 });
-        dispatchSaveShortcut(true, false, target);
-        dispatchSaveShortcut(false, true, target);
-        saveMethod = "shortcut";
-      } else if (attempt === 1) {
-        log("Save attempt via save button", { file: targetPath, attempt: attempt + 1 });
-        let clicked = false;
-        for (const control of saveControls.slice(0, 3)) {
-          try {
-            fireClick(control);
-            if (typeof control.click === "function") {
-              control.click();
-            }
-            clicked = true;
-            break;
-          } catch (_error) {
-            // Try next save control.
-          }
-        }
-        if (!clicked) {
-          dispatchSaveShortcut(true, false, target);
-          dispatchSaveShortcut(false, true, target);
-        } else {
-          saveMethod = "button";
-        }
-      } else {
-        log("Final save attempt via shortcut+button", { file: targetPath, attempt: attempt + 1 });
-        dispatchSaveShortcut(true, false, target);
-        dispatchSaveShortcut(false, true, target);
-        for (const control of saveControls.slice(0, 1)) {
-          try {
-            fireClick(control);
-            if (typeof control.click === "function") {
-              control.click();
-            }
-            saveMethod = "button+shortcut";
-          } catch (_error) {
-            // Ignore and continue.
-          }
-        }
-      }
+    log("Save attempt via keyboard", { file: targetPath, attempt: 1 });
+    dispatchSaveShortcut(true, false, target);
+    dispatchSaveShortcut(false, true, target);
+    let settle = await waitForSettle(3000);
+    if (settle.ok) {
+      return { ok: true, method: "shortcut" };
+    }
+    if (settle.reason) {
+      return { ok: false, method: "shortcut", reason: settle.reason };
+    }
 
-      const settle = await waitForSettle(attempt === 0 ? 1600 : 2200);
-      if (settle.ok) {
-        return { ok: true, method: saveMethod };
+    log("Save attempt via save button", { file: targetPath, attempt: 2 });
+    let clicked = false;
+    for (const control of saveControls.slice(0, 2)) {
+      try {
+        fireClick(control);
+        if (typeof control.click === "function") {
+          control.click();
+        }
+        clicked = true;
+        break;
+      } catch (_error) {
+        // Try next save control.
       }
-      if (settle.reason) {
-        return { ok: false, method: saveMethod, reason: settle.reason };
-      }
+    }
+    saveMethod = clicked ? "button" : "button-missing";
+    settle = await waitForSettle(3200);
+    if (settle.ok) {
+      return { ok: true, method: saveMethod };
+    }
+    if (settle.reason) {
+      return { ok: false, method: saveMethod, reason: settle.reason };
+    }
+
+    log("Final save attempt via keyboard", { file: targetPath, attempt: 3 });
+    dispatchSaveShortcut(true, false, target);
+    dispatchSaveShortcut(false, true, target);
+    saveMethod = "shortcut-final";
+    settle = await waitForSettle(3200);
+    if (settle.ok) {
+      return { ok: true, method: saveMethod };
+    }
+    if (settle.reason) {
+      return { ok: false, method: saveMethod, reason: settle.reason };
     }
 
     if (lastDirtyState === true) {
@@ -2632,6 +2631,7 @@ async function applyTemplatesInPage(filesByPath) {
           file: filePath,
           reason: nodeMatch.reason || "No matching file entry found in Tebex file tree."
         });
+        log("Continuing to next file after match failure", { file: filePath });
         continue;
       }
 
@@ -2667,6 +2667,7 @@ async function applyTemplatesInPage(filesByPath) {
                 preSwitchSave.reason ||
                 `Current file ${currentlyActive} is unsaved and could not be saved before switching.`
             });
+            log("Continuing to next file after pre-switch save failure", { file: filePath });
             continue;
           }
           log("Pre-switch save succeeded", {
@@ -2703,6 +2704,7 @@ async function applyTemplatesInPage(filesByPath) {
                 preRetrySave.reason ||
                 `Unsaved-change prompt blocked switch while opening ${filePath}.`
             });
+            log("Continuing to next file after blocked-switch retry failure", { file: filePath });
             continue;
           }
           await wait(260);
@@ -2714,6 +2716,7 @@ async function applyTemplatesInPage(filesByPath) {
               file: filePath,
               reason: `Switch to ${filePath} still blocked by unsaved changes after save retry.`
             });
+            log("Continuing to next file after repeated blocked switch", { file: filePath });
             continue;
           }
         }
@@ -2741,6 +2744,7 @@ async function applyTemplatesInPage(filesByPath) {
             file: filePath,
             reason: "Could not confirm the exact target file/directory became active."
           });
+          log("Continuing to next file after activation failure", { file: filePath });
           continue;
         }
 
@@ -2763,6 +2767,7 @@ async function applyTemplatesInPage(filesByPath) {
             file: filePath,
             reason: "Could not find a writable editor instance after opening file."
           });
+          log("Continuing to next file after write failure", { file: filePath });
           continue;
         }
         await wait(120);
@@ -2787,6 +2792,7 @@ async function applyTemplatesInPage(filesByPath) {
             file: filePath,
             reason: saveResult.reason || "Save verification failed."
           });
+          log("Continuing to next file after save failure", { file: filePath });
           continue;
         }
         log("Save succeeded", {
