@@ -136,10 +136,16 @@ async function extractFromPage(tabId) {
     const combinedSources = Object.create(null);
     const detectedNames = new Set();
     const missingNames = new Set();
+    const combinedErrors = Object.create(null);
+    const frameErrors = [];
     let supportedFrameFound = false;
     let pageUrl = "";
 
     for (const frameResult of injection) {
+      if (frameResult && frameResult.error) {
+        frameErrors.push(String(frameResult.error));
+        continue;
+      }
       const result = frameResult ? frameResult.result : null;
       if (!result || typeof result !== "object") {
         continue;
@@ -155,6 +161,7 @@ async function extractFromPage(tabId) {
 
       const files = result.files || {};
       const sources = result.sources || {};
+      const errors = result.errors || {};
       for (const [name, content] of Object.entries(files)) {
         const normalizedName = normalizePath(name);
         const nextContent = String(content || "");
@@ -166,6 +173,13 @@ async function extractFromPage(tabId) {
         detectedNames.add(normalizedName);
       }
 
+      for (const [name, reason] of Object.entries(errors)) {
+        const normalizedName = normalizePath(name);
+        if (!combinedErrors[normalizedName]) {
+          combinedErrors[normalizedName] = String(reason || "");
+        }
+      }
+
       const missingFiles = result.missingFiles || [];
       for (const missingFile of missingFiles) {
         missingNames.add(normalizePath(missingFile));
@@ -174,11 +188,23 @@ async function extractFromPage(tabId) {
     }
 
     if (!supportedFrameFound) {
+      if (frameErrors.length > 0) {
+        return {
+          isSupportedPage: false,
+          errorMessage: `Extraction script error: ${frameErrors[0]}`,
+          files: {},
+          sources: {},
+          errors: {},
+          detectedFileCount: 0,
+          missingFiles: []
+        };
+      }
       return {
         isSupportedPage: false,
         errorMessage: "This page is not a supported Tebex editor domain.",
         files: {},
         sources: {},
+        errors: {},
         detectedFileCount: 0,
         missingFiles: []
       };
@@ -191,6 +217,7 @@ async function extractFromPage(tabId) {
       pageUrl,
       files: combinedFiles,
       sources: combinedSources,
+      errors: combinedErrors,
       detectedFileCount: detectedNames.size,
       extractedFileCount: Object.keys(combinedFiles).length,
       missingFiles: finalMissing
@@ -457,7 +484,12 @@ async function applyZipFilesToPage(tabId, filesByPath) {
     }
 
     const supportedResults = [];
+    const frameErrors = [];
     for (const frameResult of injection) {
+      if (frameResult && frameResult.error) {
+        frameErrors.push(String(frameResult.error));
+        continue;
+      }
       const result = frameResult ? frameResult.result : null;
       if (result && result.isSupportedPage) {
         supportedResults.push(result);
@@ -465,6 +497,16 @@ async function applyZipFilesToPage(tabId, filesByPath) {
     }
 
     if (supportedResults.length === 0) {
+      if (frameErrors.length > 0) {
+        return {
+          isSupportedPage: false,
+          errorMessage: `Upload script error: ${frameErrors[0]}`,
+          totalRequested: Object.keys(filesByPath).length,
+          matchedCount: 0,
+          uploadedFiles: [],
+          failedFiles: []
+        };
+      }
       return {
         isSupportedPage: false,
         errorMessage: "This page is not a supported Tebex editor domain.",
@@ -625,30 +667,6 @@ async function extractTebexFilesInPage(defaultFiles) {
       return true;
     }
     return candidate.endsWith("/" + target);
-  }
-
-  function isSameFileName(a, b) {
-    const left = normalizeFileName(a).toLowerCase();
-    const right = normalizeFileName(b).toLowerCase();
-    if (!left || !right) {
-      return false;
-    }
-    if (left === right) {
-      return true;
-    }
-    if (left.endsWith("/" + right) || right.endsWith("/" + left)) {
-      return true;
-    }
-    return getBaseName(left) === getBaseName(right);
-  }
-
-  function getParentDir(path) {
-    const normalized = normalizeFileName(path).toLowerCase();
-    const segments = normalized.split("/");
-    if (segments.length <= 1) {
-      return "";
-    }
-    return segments.slice(0, -1).join("/");
   }
 
   function isSameFileName(a, b) {
@@ -1466,6 +1484,42 @@ async function applyTemplatesInPage(filesByPath) {
     const normalized = normalizeFileName(path);
     const segments = normalized.split("/");
     return segments[segments.length - 1] || normalized;
+  }
+
+  function getParentDir(path) {
+    const normalized = normalizeFileName(path).toLowerCase();
+    const segments = normalized.split("/");
+    if (segments.length <= 1) {
+      return "";
+    }
+    return segments.slice(0, -1).join("/");
+  }
+
+  function strictPathMatch(targetPath, candidatePath) {
+    const target = normalizeFileName(targetPath).toLowerCase();
+    const candidate = normalizeFileName(candidatePath).toLowerCase();
+    if (!target || !candidate) {
+      return false;
+    }
+    if (target === candidate) {
+      return true;
+    }
+    return candidate.endsWith("/" + target);
+  }
+
+  function isSameFileName(a, b) {
+    const left = normalizeFileName(a).toLowerCase();
+    const right = normalizeFileName(b).toLowerCase();
+    if (!left || !right) {
+      return false;
+    }
+    if (left === right) {
+      return true;
+    }
+    if (left.endsWith("/" + right) || right.endsWith("/" + left)) {
+      return true;
+    }
+    return getBaseName(left) === getBaseName(right);
   }
 
   function extractNames(raw) {
