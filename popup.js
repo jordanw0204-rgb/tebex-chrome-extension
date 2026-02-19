@@ -451,10 +451,18 @@ function renderUploadSummary(result) {
 
   const uploaded = Array.isArray(result.uploadedFiles) ? result.uploadedFiles : [];
   const failed = Array.isArray(result.failedFiles) ? result.failedFiles : [];
+  const blockedSwitchPrompts = Number(result.blockedSwitchPrompts || 0);
 
   addFileLine(
     `Uploaded ${uploaded.length}/${result.totalRequested || uploaded.length} file(s). Matched ${result.matchedCount || 0}.`
   );
+
+  if (blockedSwitchPrompts > 0) {
+    addFileLine(
+      `Warn: blocked ${blockedSwitchPrompts} unsaved-change switch prompt(s) and retried save.`,
+      true
+    );
+  }
 
   for (const item of uploaded) {
     const method = item && item.method ? ` [${item.method}]` : "";
@@ -595,9 +603,16 @@ async function importFromZip(zipFile) {
     }
 
     setProgress(100);
-    setStatus(
-      `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s) from ZIP.`
-    );
+    const blockedPrompts = Number(uploadResult.blockedSwitchPrompts || 0);
+    if (blockedPrompts > 0) {
+      setStatus(
+        `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s). Blocked ${blockedPrompts} unsaved switch prompt(s).`
+      );
+    } else {
+      setStatus(
+        `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s) from ZIP.`
+      );
+    }
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     setStatus(`Upload failed: ${message}`);
@@ -2168,10 +2183,33 @@ async function applyTemplatesInPage(filesByPath) {
     const dirtyBefore = activeFileLooksDirty();
     let lastDirtyState = dirtyBefore;
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
+    function areSaveControlsIdle(controls) {
+      if (!controls || controls.length === 0) {
+        return null;
+      }
+
+      let sawVisible = false;
+      for (const control of controls.slice(0, 3)) {
+        if (!isVisible(control)) {
+          continue;
+        }
+        sawVisible = true;
+        const disabled =
+          control.disabled ||
+          control.getAttribute("aria-disabled") === "true" ||
+          control.classList.contains("disabled");
+        if (!disabled) {
+          return false;
+        }
+      }
+
+      return sawVisible ? true : null;
+    }
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       dispatchSaveShortcut(true, false, target);
       dispatchSaveShortcut(false, true, target);
-      await wait(80);
+      await wait(100);
 
       let clicked = false;
       for (const control of saveControls.slice(0, 3)) {
@@ -2193,7 +2231,7 @@ async function applyTemplatesInPage(filesByPath) {
         saveMethod = "shortcut-retry";
       }
 
-      await wait(170);
+      await wait(220);
 
       const activeName = getActiveFileName();
       if (activeName && !activeNameMatchesTarget(activeName, targetPath, maps)) {
@@ -2206,7 +2244,11 @@ async function applyTemplatesInPage(filesByPath) {
 
       const dirtyAfter = activeFileLooksDirty();
       lastDirtyState = dirtyAfter;
-      if (dirtyAfter === false || (dirtyBefore === null && attempt >= 1)) {
+      const controlsIdle = areSaveControlsIdle(saveControls);
+      if (dirtyAfter === false) {
+        return { ok: true, method: saveMethod };
+      }
+      if (dirtyAfter === null && controlsIdle === true && attempt >= 2) {
         return { ok: true, method: saveMethod };
       }
     }
@@ -2222,105 +2264,170 @@ async function applyTemplatesInPage(filesByPath) {
     return { ok: true, method: saveMethod };
   }
 
-  const requestedEntries = Object.entries(filesByPath || {})
-    .map(([path, content]) => [normalizeFileName(path), String(content || "")])
-    .filter(([path]) => isTemplatePath(path) && isLikelyEditorFilePath(path))
-    .sort((a, b) => a[0].localeCompare(b[0]));
+  const originalConfirm =
+    typeof window.confirm === "function" ? window.confirm.bind(window) : null;
+  let blockedSwitchPrompts = 0;
+  if (originalConfirm) {
+    window.confirm = (message) => {
+      const text = String(message || "").toLowerCase();
+      if (text.includes("unsaved") || text.includes("different page")) {
+        blockedSwitchPrompts += 1;
+        return false;
+      }
+      return originalConfirm(message);
+    };
+  }
 
-  const uploadedFiles = [];
-  const failedFiles = [];
-  let matchedCount = 0;
+  try {
+    const requestedEntries = Object.entries(filesByPath || {})
+      .map(([path, content]) => [normalizeFileName(path), String(content || "")])
+      .filter(([path]) => isTemplatePath(path) && isLikelyEditorFilePath(path))
+      .sort((a, b) => a[0].localeCompare(b[0]));
 
-  for (const [filePath, content] of requestedEntries) {
-    let maps = collectTreeMaps();
-    let nodeMatch = findNodeForFile(filePath, maps);
+    const uploadedFiles = [];
+    const failedFiles = [];
+    let matchedCount = 0;
 
-    if (!nodeMatch.element) {
-      await wait(120);
-      maps = collectTreeMaps();
-      nodeMatch = findNodeForFile(filePath, maps);
-    }
+    for (const [filePath, content] of requestedEntries) {
+      let maps = collectTreeMaps();
+      let nodeMatch = findNodeForFile(filePath, maps);
 
-    if (!nodeMatch.element) {
-      failedFiles.push({
-        file: filePath,
-        reason: nodeMatch.reason || "No matching file entry found in Tebex file tree."
-      });
-      continue;
-    }
-
-    matchedCount += 1;
-
-    try {
-      const node = nodeMatch.element;
-      if (isVisible(node)) {
-        node.scrollIntoView({ block: "center", inline: "nearest" });
+      if (!nodeMatch.element) {
+        await wait(120);
+        maps = collectTreeMaps();
+        nodeMatch = findNodeForFile(filePath, maps);
       }
 
-      fireClick(node);
-      let confirmedActive = false;
-      for (let attempt = 0; attempt < 7; attempt += 1) {
-        await wait(attempt < 3 ? 110 : 170);
-        const activeName = getActiveFileName();
-        if (!activeName) {
-          if (attempt >= 3 && (nodeMatch.matchType === "exact" || nodeMatch.matchType === "suffix")) {
+      if (!nodeMatch.element) {
+        failedFiles.push({
+          file: filePath,
+          reason: nodeMatch.reason || "No matching file entry found in Tebex file tree."
+        });
+        continue;
+      }
+
+      matchedCount += 1;
+
+      try {
+        const currentlyActive = getActiveFileName();
+        if (
+          activeFileLooksDirty() === true &&
+          currentlyActive &&
+          !activeNameMatchesTarget(currentlyActive, filePath, maps)
+        ) {
+          const preSwitchSave = await triggerSaveForFile(currentlyActive, maps);
+          if (!preSwitchSave.ok) {
+            failedFiles.push({
+              file: filePath,
+              reason:
+                preSwitchSave.reason ||
+                `Current file ${currentlyActive} is unsaved and could not be saved before switching.`
+            });
+            continue;
+          }
+          await wait(260);
+        }
+
+        const node = nodeMatch.element;
+        if (isVisible(node)) {
+          node.scrollIntoView({ block: "center", inline: "nearest" });
+        }
+
+        let promptCountBefore = blockedSwitchPrompts;
+        fireClick(node);
+        if (blockedSwitchPrompts > promptCountBefore) {
+          const activeName = getActiveFileName() || currentlyActive || filePath;
+          const preRetrySave = await triggerSaveForFile(activeName, maps);
+          if (!preRetrySave.ok) {
+            failedFiles.push({
+              file: filePath,
+              reason:
+                preRetrySave.reason ||
+                `Unsaved-change prompt blocked switch while opening ${filePath}.`
+            });
+            continue;
+          }
+          await wait(260);
+          promptCountBefore = blockedSwitchPrompts;
+          fireClick(node);
+          if (blockedSwitchPrompts > promptCountBefore) {
+            failedFiles.push({
+              file: filePath,
+              reason: `Switch to ${filePath} still blocked by unsaved changes after save retry.`
+            });
+            continue;
+          }
+        }
+
+        let confirmedActive = false;
+        for (let attempt = 0; attempt < 7; attempt += 1) {
+          await wait(attempt < 3 ? 110 : 170);
+          const activeName = getActiveFileName();
+          if (!activeName) {
+            if (attempt >= 3 && (nodeMatch.matchType === "exact" || nodeMatch.matchType === "suffix")) {
+              confirmedActive = true;
+              break;
+            }
+            continue;
+          }
+          if (activeNameMatchesTarget(activeName, filePath, maps)) {
             confirmedActive = true;
             break;
           }
+        }
+
+        if (!confirmedActive) {
+          failedFiles.push({
+            file: filePath,
+            reason: "Could not confirm the exact target file/directory became active."
+          });
           continue;
         }
-        if (activeNameMatchesTarget(activeName, filePath, maps)) {
-          confirmedActive = true;
-          break;
+
+        const writeMethod = writeEditorContent(content);
+        if (!writeMethod) {
+          failedFiles.push({
+            file: filePath,
+            reason: "Could not find a writable editor instance after opening file."
+          });
+          continue;
         }
-      }
 
-      if (!confirmedActive) {
+        const saveResult = await triggerSaveForFile(filePath, maps);
+        if (!saveResult.ok) {
+          failedFiles.push({
+            file: filePath,
+            reason: saveResult.reason || "Save verification failed."
+          });
+          continue;
+        }
+
+        uploadedFiles.push({
+          file: filePath,
+          method: writeMethod,
+          saveMethod: saveResult.method
+        });
+      } catch (error) {
         failedFiles.push({
           file: filePath,
-          reason: "Could not confirm the exact target file/directory became active."
+          reason: error && error.message ? error.message : "Unknown upload error."
         });
-        continue;
       }
+    }
 
-      const writeMethod = writeEditorContent(content);
-      if (!writeMethod) {
-        failedFiles.push({
-          file: filePath,
-          reason: "Could not find a writable editor instance after opening file."
-        });
-        continue;
-      }
-
-      const saveResult = await triggerSaveForFile(filePath, maps);
-      if (!saveResult.ok) {
-        failedFiles.push({
-          file: filePath,
-          reason: saveResult.reason || "Save verification failed."
-        });
-        continue;
-      }
-
-      uploadedFiles.push({
-        file: filePath,
-        method: writeMethod,
-        saveMethod: saveResult.method
-      });
-    } catch (error) {
-      failedFiles.push({
-        file: filePath,
-        reason: error && error.message ? error.message : "Unknown upload error."
-      });
+    return {
+      isSupportedPage: true,
+      pageUrl: String(window.location.href || ""),
+      totalRequested: requestedEntries.length,
+      matchedCount,
+      uploadedCount: uploadedFiles.length,
+      uploadedFiles,
+      failedFiles,
+      blockedSwitchPrompts
+    };
+  } finally {
+    if (originalConfirm) {
+      window.confirm = originalConfirm;
     }
   }
-
-  return {
-    isSupportedPage: true,
-    pageUrl: String(window.location.href || ""),
-    totalRequested: requestedEntries.length,
-    matchedCount,
-    uploadedCount: uploadedFiles.length,
-    uploadedFiles,
-    failedFiles
-  };
 }
