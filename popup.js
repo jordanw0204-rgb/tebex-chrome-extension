@@ -461,6 +461,9 @@ function renderUploadSummary(result) {
   const uploaded = Array.isArray(result.uploadedFiles) ? result.uploadedFiles : [];
   const failed = Array.isArray(result.failedFiles) ? result.failedFiles : [];
   const blockedSwitchPrompts = Number(result.blockedSwitchPrompts || 0);
+  const blockedAlerts = Array.isArray(result.blockedAlertMessages)
+    ? result.blockedAlertMessages
+    : [];
 
   addFileLine(
     `Uploaded ${uploaded.length}/${result.totalRequested || uploaded.length} file(s). Matched ${result.matchedCount || 0}.`
@@ -471,6 +474,13 @@ function renderUploadSummary(result) {
       `Warn: blocked ${blockedSwitchPrompts} unsaved-change switch prompt(s) and retried save.`,
       true
     );
+  }
+
+  if (blockedAlerts.length > 0) {
+    addFileLine(`Warn: intercepted ${blockedAlerts.length} alert(s) from the site.`, true);
+    for (const message of blockedAlerts.slice(0, 3)) {
+      addFileLine(`Alert: ${message}`, true);
+    }
   }
 
   for (const item of uploaded) {
@@ -661,7 +671,8 @@ async function importFromZip(zipFile) {
       uploadedCount: 0,
       uploadedFiles: [],
       failedFiles: [],
-      blockedSwitchPrompts: 0
+      blockedSwitchPrompts: 0,
+      blockedAlertMessages: []
     };
 
     for (let i = 0; i < sortedFiles.length; i += 1) {
@@ -695,6 +706,9 @@ async function importFromZip(zipFile) {
       const uploadedCount = Number(singleResult.uploadedCount || 0);
       aggregateResult.matchedCount += matchedCount;
       aggregateResult.blockedSwitchPrompts += Number(singleResult.blockedSwitchPrompts || 0);
+      if (Array.isArray(singleResult.blockedAlertMessages)) {
+        aggregateResult.blockedAlertMessages.push(...singleResult.blockedAlertMessages);
+      }
 
       if (uploadedCount > 0 && Array.isArray(singleResult.uploadedFiles)) {
         const matchingUploaded = singleResult.uploadedFiles.filter(
@@ -721,6 +735,10 @@ async function importFromZip(zipFile) {
       debugLog(`Upload failed for ${fileName}: ${reason}`);
     }
 
+    aggregateResult.blockedAlertMessages = Array.from(
+      new Set(aggregateResult.blockedAlertMessages)
+    );
+
     renderUploadSummary(aggregateResult);
 
     const uploadedCount = Number(aggregateResult.uploadedCount || 0);
@@ -732,9 +750,16 @@ async function importFromZip(zipFile) {
 
     setProgress(100);
     const blockedPrompts = Number(aggregateResult.blockedSwitchPrompts || 0);
+    const blockedAlerts = Array.isArray(aggregateResult.blockedAlertMessages)
+      ? aggregateResult.blockedAlertMessages.length
+      : 0;
     if (blockedPrompts > 0) {
       setStatus(
-        `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s). Blocked ${blockedPrompts} unsaved switch prompt(s).`
+        `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s). Blocked ${blockedPrompts} unsaved switch prompt(s) and ${blockedAlerts} alert(s).`
+      );
+    } else if (blockedAlerts > 0) {
+      setStatus(
+        `Done. Uploaded ${uploadedCount}/${sortedFiles.length} file(s). Intercepted ${blockedAlerts} site alert(s).`
       );
     } else {
       setStatus(
@@ -2228,6 +2253,50 @@ async function applyTemplatesInPage(filesByPath) {
     return null;
   }
 
+  function readEditorContent() {
+    try {
+      const monacoEditor = pickMonacoEditor();
+      if (monacoEditor && typeof monacoEditor.getModel === "function") {
+        const model = monacoEditor.getModel();
+        if (model && typeof model.getValue === "function") {
+          return String(model.getValue() || "").replace(/\r\n?/g, "\n");
+        }
+      }
+    } catch (_error) {
+      // Continue to next editor type.
+    }
+
+    try {
+      const codeMirror = pickCodeMirrorInstance();
+      if (codeMirror && typeof codeMirror.getValue === "function") {
+        return String(codeMirror.getValue() || "").replace(/\r\n?/g, "\n");
+      }
+    } catch (_error) {
+      // Continue to next editor type.
+    }
+
+    try {
+      const aceEditor = pickAceEditor();
+      if (aceEditor && typeof aceEditor.getValue === "function") {
+        return String(aceEditor.getValue() || "").replace(/\r\n?/g, "\n");
+      }
+    } catch (_error) {
+      // Continue to next editor type.
+    }
+
+    const textarea = pickTextarea();
+    if (textarea) {
+      return String(textarea.value || textarea.textContent || "").replace(/\r\n?/g, "\n");
+    }
+
+    const contentEditable = pickContentEditable();
+    if (contentEditable) {
+      return String(contentEditable.textContent || "").replace(/\r\n?/g, "\n");
+    }
+
+    return null;
+  }
+
   function findSaveControls() {
     const candidates = Array.from(
       document.querySelectorAll(
@@ -2253,7 +2322,7 @@ async function applyTemplatesInPage(filesByPath) {
         .join(" ")
         .toLowerCase();
 
-      if (!/\bsave\b/.test(text)) {
+      if (!/\bsave\b/.test(text) && !/ctrl\+s|cmd\+s|⌘\s*s/.test(text)) {
         continue;
       }
 
@@ -2266,6 +2335,9 @@ async function applyTemplatesInPage(filesByPath) {
       }
       if (/\bsave\b/.test(text)) {
         score += 20;
+      }
+      if (/ctrl\+s|cmd\+s|⌘\s*s/.test(text)) {
+        score += 10;
       }
       if (/publish|update|apply/.test(text)) {
         score += 4;
@@ -2285,10 +2357,14 @@ async function applyTemplatesInPage(filesByPath) {
     const eventInit = {
       key: "s",
       code: "KeyS",
+      keyCode: 83,
+      which: 83,
+      charCode: 83,
       bubbles: true,
       cancelable: true,
       ctrlKey,
-      metaKey
+      metaKey,
+      composed: true
     };
 
     const targets = [target, document.activeElement, document, window].filter(Boolean);
@@ -2300,6 +2376,14 @@ async function applyTemplatesInPage(filesByPath) {
       } catch (_error) {
         // Keep trying remaining targets.
       }
+    }
+
+    try {
+      if (document && typeof document.execCommand === "function") {
+        document.execCommand("save");
+      }
+    } catch (_error) {
+      // Ignore unsupported execCommand.
     }
   }
 
@@ -2355,50 +2439,84 @@ async function applyTemplatesInPage(filesByPath) {
       return sawVisible ? true : null;
     }
 
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      dispatchSaveShortcut(true, false, target);
-      dispatchSaveShortcut(false, true, target);
-      await wait(100);
+    async function waitForSettle(maxMs) {
+      let elapsed = 0;
+      const step = 150;
+      while (elapsed < maxMs) {
+        await wait(step);
+        elapsed += step;
 
-      let clicked = false;
-      for (const control of saveControls.slice(0, 3)) {
-        try {
-          fireClick(control);
-          if (typeof control.click === "function") {
-            control.click();
+        const activeName = getActiveFileName();
+        if (activeName && !activeNameMatchesTarget(activeName, targetPath, maps)) {
+          return {
+            ok: false,
+            reason: `Active file switched to ${activeName} while saving ${targetPath}.`
+          };
+        }
+
+        const dirtyAfter = activeFileLooksDirty();
+        lastDirtyState = dirtyAfter;
+        const controlsIdle = areSaveControlsIdle(saveControls);
+        if (dirtyAfter === false) {
+          return { ok: true };
+        }
+        if (dirtyAfter === null && controlsIdle === true) {
+          return { ok: true };
+        }
+      }
+      return { ok: false };
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt === 0) {
+        log("Save attempt via keyboard", { file: targetPath, attempt: attempt + 1 });
+        dispatchSaveShortcut(true, false, target);
+        dispatchSaveShortcut(false, true, target);
+        saveMethod = "shortcut";
+      } else if (attempt === 1) {
+        log("Save attempt via save button", { file: targetPath, attempt: attempt + 1 });
+        let clicked = false;
+        for (const control of saveControls.slice(0, 3)) {
+          try {
+            fireClick(control);
+            if (typeof control.click === "function") {
+              control.click();
+            }
+            clicked = true;
+            break;
+          } catch (_error) {
+            // Try next save control.
           }
-          clicked = true;
-          break;
-        } catch (_error) {
-          // Try next save control.
+        }
+        if (!clicked) {
+          dispatchSaveShortcut(true, false, target);
+          dispatchSaveShortcut(false, true, target);
+        } else {
+          saveMethod = "button";
+        }
+      } else {
+        log("Final save attempt via shortcut+button", { file: targetPath, attempt: attempt + 1 });
+        dispatchSaveShortcut(true, false, target);
+        dispatchSaveShortcut(false, true, target);
+        for (const control of saveControls.slice(0, 1)) {
+          try {
+            fireClick(control);
+            if (typeof control.click === "function") {
+              control.click();
+            }
+            saveMethod = "button+shortcut";
+          } catch (_error) {
+            // Ignore and continue.
+          }
         }
       }
 
-      if (clicked) {
-        saveMethod = "button+shortcut";
-      } else if (attempt > 0) {
-        saveMethod = "shortcut-retry";
-      }
-
-      await wait(220);
-
-      const activeName = getActiveFileName();
-      if (activeName && !activeNameMatchesTarget(activeName, targetPath, maps)) {
-        return {
-          ok: false,
-          method: saveMethod,
-          reason: `Active file switched to ${activeName} while saving ${targetPath}.`
-        };
-      }
-
-      const dirtyAfter = activeFileLooksDirty();
-      lastDirtyState = dirtyAfter;
-      const controlsIdle = areSaveControlsIdle(saveControls);
-      if (dirtyAfter === false) {
+      const settle = await waitForSettle(attempt === 0 ? 1600 : 2200);
+      if (settle.ok) {
         return { ok: true, method: saveMethod };
       }
-      if (dirtyAfter === null && controlsIdle === true && attempt >= 2) {
-        return { ok: true, method: saveMethod };
+      if (settle.reason) {
+        return { ok: false, method: saveMethod, reason: settle.reason };
       }
     }
 
@@ -2413,8 +2531,9 @@ async function applyTemplatesInPage(filesByPath) {
     return { ok: true, method: saveMethod };
   }
 
-  const confirmPatches = [];
+  const dialogPatches = [];
   let blockedSwitchPrompts = 0;
+  let blockedAlertMessages = [];
 
   function patchConfirm(targetWindow) {
     if (!targetWindow || typeof targetWindow.confirm !== "function") {
@@ -2438,17 +2557,42 @@ async function applyTemplatesInPage(filesByPath) {
     try {
       targetWindow.confirm = patched;
       if (targetWindow.confirm === patched) {
-        confirmPatches.push({ targetWindow, original });
+        dialogPatches.push({ targetWindow, type: "confirm", original });
       }
     } catch (_error) {
       // Ignore non-writable confirm.
     }
   }
 
+  function patchAlert(targetWindow) {
+    if (!targetWindow || typeof targetWindow.alert !== "function") {
+      return;
+    }
+
+    const original = targetWindow.alert.bind(targetWindow);
+    const patched = (message) => {
+      const text = String(message || "");
+      blockedAlertMessages.push(text);
+      log("Intercepted alert", { message: text });
+      return undefined;
+    };
+
+    try {
+      targetWindow.alert = patched;
+      if (targetWindow.alert === patched) {
+        dialogPatches.push({ targetWindow, type: "alert", original });
+      }
+    } catch (_error) {
+      // Ignore non-writable alert.
+    }
+  }
+
   patchConfirm(window);
+  patchAlert(window);
   try {
     if (window.top && window.top !== window) {
       patchConfirm(window.top);
+      patchAlert(window.top);
     }
   } catch (_error) {
     // Cross-origin top window.
@@ -2600,7 +2744,19 @@ async function applyTemplatesInPage(filesByPath) {
           continue;
         }
 
-        const writeMethod = writeEditorContent(content);
+        const expectedContent = String(content || "").replace(/\r\n?/g, "\n");
+        const beforeContent = readEditorContent();
+        if (typeof beforeContent === "string" && beforeContent === expectedContent) {
+          log("Content already matches target, skipping write/save", { file: filePath });
+          uploadedFiles.push({
+            file: filePath,
+            method: "unchanged",
+            saveMethod: "not-needed"
+          });
+          continue;
+        }
+
+        const writeMethod = writeEditorContent(expectedContent);
         if (!writeMethod) {
           log("Write failed: no editor detected", { file: filePath });
           failedFiles.push({
@@ -2608,6 +2764,16 @@ async function applyTemplatesInPage(filesByPath) {
             reason: "Could not find a writable editor instance after opening file."
           });
           continue;
+        }
+        await wait(120);
+        const afterContent = readEditorContent();
+        if (typeof afterContent === "string" && afterContent !== expectedContent) {
+          log("Write verification mismatch", {
+            file: filePath,
+            method: writeMethod,
+            expectedLength: expectedContent.length,
+            actualLength: afterContent.length
+          });
         }
         log("Content written", { file: filePath, method: writeMethod });
 
@@ -2648,7 +2814,8 @@ async function applyTemplatesInPage(filesByPath) {
     log("Upload script completed", {
       uploaded: uploadedFiles.length,
       failed: failedFiles.length,
-      blockedSwitchPrompts
+      blockedSwitchPrompts,
+      blockedAlerts: blockedAlertMessages.length
     });
 
     return {
@@ -2660,12 +2827,17 @@ async function applyTemplatesInPage(filesByPath) {
       uploadedFiles,
       failedFiles,
       blockedSwitchPrompts,
+      blockedAlertMessages,
       logs: debugLogs
     };
   } finally {
-    for (const patch of confirmPatches) {
+    for (const patch of dialogPatches) {
       try {
-        patch.targetWindow.confirm = patch.original;
+        if (patch.type === "confirm") {
+          patch.targetWindow.confirm = patch.original;
+        } else if (patch.type === "alert") {
+          patch.targetWindow.alert = patch.original;
+        }
       } catch (_error) {
         // Ignore restore failures.
       }
